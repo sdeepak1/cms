@@ -343,7 +343,272 @@
    try { window.editor.destroy(); } catch (e) { console.warn('Could not destroy old editor:', e); }
   }
   window.editor = editor;
+  /***************************************************************
+   * Style Sync Module
+   *
+   * Purpose
+   * - Keep CssComposer rules and GrapesJS component styles in sync.
+   * - Fixes these bugs you reported:
+   *    • Changing a style (e.g., color) creates duplicate CSS rules instead of updating the existing rule.
+   *    • After loading a saved page, the Style Manager doesn't show the component's current style values.
+   *    • Deleting a component leaves orphaned CSS rules in the CSS tab.
+   *
+   * Behavior (non-breaking)
+   * - On editor load / when styles are applied: map existing CssComposer rules (with ID selectors like #compId)
+   *   to components and copy the rule style onto the matching component model (so Style Manager shows values).
+   * - When a component's style changes (Style Manager UI, inline style change, programmatic), update the existing
+   *   CssComposer rule that targets that component (selector `#<id>`), or create a single rule if none exists.
+   * - When a component is removed, remove any CssComposer rule that targets its ID (clean orphaned rules).
+   *
+   * Integration note
+   * - Insert this module right after the editor is created and assigned to window.editor,
+   *   and before loading PAGE_HTML / calling editor.setComponents(...) (so the initial sync can run).
+   *
+   * Safe guards
+   * - Uses lightweight locks (model.__styleSyncLock) to avoid infinite loops between programmatic style-sync
+   *   and the model's change events.
+   *
+   ***************************************************************/
+  (function styleSyncModule(editor) {
+   if (!editor || !editor.CssComposer || !editor.getWrapper) return;
 
+   const cssComposer = editor.CssComposer;
+   const selectorManager = editor.SelectorManager;
+   const wrapper = () => editor.getWrapper();
+   const failedSelectors = new Set(); // avoid repeated failing attempts
+
+   // Ensure a component has an ID and attribute.id is set
+   function ensureComponentId(model) {
+    if (!model) return null;
+    let id = null;
+    try { id = model.getId ? model.getId() : null; } catch (e) { id = null; }
+    const attrs = (model.getAttributes && model.getAttributes()) || {};
+    const attrId = attrs.id || null;
+
+    if (!id && attrId) {
+     id = attrId;
+     try { model.setId && model.setId(id); } catch (e) { }
+    }
+
+    if (!id) {
+     id = attrs.id || `gjs-${model.cid || Math.random().toString(36).slice(2, 9)}`;
+     try { model.setId && model.setId(id); } catch (e) { }
+     try { model.set && model.set('attributes', Object.assign({}, attrs, { id })); } catch (e) { }
+    } else {
+     if (!attrs.id) {
+      try { model.set && model.set('attributes', Object.assign({}, attrs, { id })); } catch (e) { }
+     }
+    }
+
+    return id;
+   }
+
+   // Robust check if a rule contains a selector name
+   function ruleHasSelector(rule, selectorName) {
+    if (!rule) return false;
+    try {
+     const sels = rule.selectors?.models || (rule.getSelectors ? rule.getSelectors().models : (rule.get && rule.get('selectors')?.models || []));
+     for (const s of sels) {
+      // s may be a model or plain object, handle both
+      const name = (typeof s.get === 'function') ? s.get('name') : (s.name || s);
+      if (name === selectorName) return true;
+     }
+    } catch (e) { /* ignore */ }
+    return false;
+   }
+
+   // Find rules that match a selector
+   function findRulesForSelector(selectorName) {
+    const all = cssComposer.getAll ? cssComposer.getAll() : (cssComposer.get && cssComposer.get('rules')) || [];
+    const matches = [];
+    try {
+     const arr = (all && all.models) ? all.models : (Array.isArray(all) ? all : []);
+     for (const r of arr) {
+      if (ruleHasSelector(r, selectorName)) matches.push(r);
+     }
+    } catch (e) { /* ignore */ }
+    return matches;
+   }
+
+   // Add or update a single rule for a component's ID selector using SelectorManager
+   function syncComponentStyleToRule(model) {
+    if (!model) return;
+    if (model.__styleSyncLock) return;
+
+    const id = ensureComponentId(model);
+    if (!id) return;
+    const selector = `#${id}`;
+
+    // If previously failed to create this selector, skip attempts
+    if (failedSelectors.has(selector)) return;
+
+    const styleObj = (typeof model.getStyle === 'function') ? model.getStyle() : (model.get && model.get('style')) || {};
+    const rules = findRulesForSelector(selector);
+
+    try {
+     if (!rules.length) {
+      // Create selector model via SelectorManager so GrapesJS gets the right object type
+      let selModel = null;
+      try {
+       if (selectorManager && typeof selectorManager.add === 'function') {
+        selModel = selectorManager.add({ name: selector });
+       } else {
+        // Fallback: if SelectorManager missing, use plain selector object
+        selModel = { name: selector };
+       }
+      } catch (e) {
+       // mark as failed and don't spam
+       failedSelectors.add(selector);
+       console.warn('StyleSync: selector creation failed for', selector, e);
+       return;
+      }
+
+      // Add rule using the selector model (or fallback object)
+      try {
+       cssComposer.add({ selectors: [selModel], style: Object.assign({}, styleObj) });
+      } catch (e) {
+       // If add fails, mark failed selector to avoid infinite messages
+       failedSelectors.add(selector);
+       console.warn('StyleSync: failed to add rule for', selector, e);
+      }
+     } else {
+      // Update primary rule's style and remove duplicates
+      const primary = rules[0];
+      try {
+       primary.set && primary.set('style', Object.assign({}, styleObj));
+      } catch (e) {
+       try { primary.set('style', Object.assign({}, styleObj)); } catch (e2) { console.warn('StyleSync: update failed for', selector, e2); }
+      }
+      for (let i = 1; i < rules.length; i++) {
+       try { rules[i].remove && rules[i].remove(); } catch (e) { /* ignore */ }
+      }
+     }
+    } catch (err) {
+     // Defensive: do not let exceptions bubble; mark selector as failed if it's a type mismatch
+     failedSelectors.add(selector);
+     console.warn('StyleSync: failed to add/update rule for', selector, err);
+    }
+   }
+
+   // Copy styles from existing CssComposer rules into components (initial load)
+   function syncRulesIntoComponents() {
+    try {
+     const all = cssComposer.getAll ? cssComposer.getAll() : (cssComposer.get && cssComposer.get('rules')) || [];
+     const arr = (all && all.models) ? all.models : (Array.isArray(all) ? all : []);
+     for (const rule of arr) {
+      const sels = rule.selectors?.models || (rule.getSelectors ? rule.getSelectors().models : (rule.get && rule.get('selectors')?.models || []));
+      if (!sels || !sels.length) continue;
+      for (const s of sels) {
+       const name = (typeof s.get === 'function') ? s.get('name') : (s.name || s);
+       if (!name || !name.startsWith('#')) continue;
+       const id = name.slice(1);
+       try {
+        const comp = wrapper().find(`#${id}`)[0];
+        if (comp) {
+         comp.__styleSyncLock = true;
+         const styleObj = rule.get('style') || {};
+         try { comp.setStyle && comp.setStyle(Object.assign({}, styleObj)); } catch (e) { comp.set && comp.set('style', Object.assign({}, styleObj)); }
+         setTimeout(() => { comp.__styleSyncLock = false; }, 10);
+        }
+       } catch (e) {
+        console.warn('StyleSync: syncRulesIntoComponents lookup failed for', id, e);
+       }
+      }
+     }
+    } catch (e) {
+     console.warn('StyleSync: syncRulesIntoComponents failed', e);
+    }
+   }
+
+   function removeRulesForComponent(model) {
+    if (!model) return;
+    const id = model.getId && model.getId();
+    if (!id) return;
+    const selector = `#${id}`;
+    const rules = findRulesForSelector(selector);
+    rules.forEach(r => {
+     try { r.remove && r.remove(); } catch (e) { console.warn('StyleSync: failed to remove rule', selector, e); }
+    });
+   }
+
+   // Attach listeners for style changes on a model
+   function attachStyleListenerTo(model) {
+    if (!model) return;
+    ensureComponentId(model);
+    if (model.__styleSyncAttached) return;
+    model.__styleSyncAttached = true;
+
+    model.on && model.on('change:style', function () {
+     try {
+      if (model.__styleSyncTimer) clearTimeout(model.__styleSyncTimer);
+      model.__styleSyncTimer = setTimeout(() => {
+       syncComponentStyleToRule(model);
+       model.__styleSyncTimer = null;
+      }, 120);
+     } catch (e) { console.warn('StyleSync: change:style handler failed', e); }
+    });
+
+    model.on && model.on('change:attributes', function () {
+     try { syncComponentStyleToRule(model); } catch (e) { }
+    });
+
+    model.on && model.on('remove', function () {
+     try { removeRulesForComponent(model); } catch (e) { }
+    });
+   }
+
+   editor.on('component:selected', (model) => {
+    if (!model) return;
+    try {
+     attachStyleListenerTo(model);
+     const id = model.getId && model.getId();
+     if (id) {
+      const selector = `#${id}`;
+      const rules = findRulesForSelector(selector);
+      if (rules.length > 0) {
+       const primary = rules[0];
+       const styleObj = primary.get('style') || {};
+       model.__styleSyncLock = true;
+       try { model.setStyle && model.setStyle(Object.assign({}, styleObj)); } catch (e) { model.set && model.set('style', Object.assign({}, styleObj)); }
+       setTimeout(() => { model.__styleSyncLock = false; }, 10);
+      }
+     }
+    } catch (e) { console.warn('StyleSync: component:selected handler error', e); }
+   });
+
+   editor.on('component:add', (model) => {
+    try {
+     attachStyleListenerTo(model);
+     setTimeout(() => syncComponentStyleToRule(model), 80);
+    } catch (e) { console.warn('StyleSync: component:add hook failed', e); }
+   });
+
+   editor.on('component:remove', (model) => {
+    try { removeRulesForComponent(model); } catch (e) { console.warn('StyleSync: component:remove hook failed', e); }
+   });
+
+   editor.on('load', () => {
+    try {
+     setTimeout(() => {
+      syncRulesIntoComponents();
+      try {
+       const allComps = wrapper().find('*') || [];
+       allComps.forEach(c => attachStyleListenerTo(c));
+      } catch (e2) { }
+     }, 300);
+    } catch (e) { console.warn('StyleSync: initial load sync failed', e); }
+   });
+
+   // Dev helpers
+   window.__GJSStyleSync = {
+    syncRulesIntoComponents,
+    syncComponentStyleToRule,
+    removeRulesForComponent,
+    findRulesForSelector,
+    failedSelectors
+   };
+
+  })(window.editor);
   editor.on('load', () => {
    const wrp = editor.getWrapper();
    wrp && wrp.set('droppable', true);
@@ -2442,6 +2707,9 @@
   editor.on('load', () => {
    renderShortcodesOnLoad(editor);
   });
+
+
+
 
  }); // end DOMContentLoaded
 
